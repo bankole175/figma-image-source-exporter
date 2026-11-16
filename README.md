@@ -47,3 +47,7 @@ The **Saved data** column shows the raw data each plugin stored, which helps whe
 ## Disclaimer
 
 Not affiliated with Figma, Unsplash or any plugin author.
+
+## License
+
+[MIT](LICENSE)
