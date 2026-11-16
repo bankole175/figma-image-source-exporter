@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Figma Image Source Exporter</title>
+<meta name="description" content="Bulk-copy the original source links (Unsplash, Pexels and more) of images placed in Figma by stock-photo plugins.">
+<style>
+  :root { --accent: #0d99ff; --err: #b00020; --muted: #666; --line: #e8e8e8; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 1040px; margin: 32px auto; padding: 0 20px; color: #1d1d1f; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  p.lead { color: #555; margin: 0 0 8px; }
+  details { color: #555; margin-bottom: 8px; }
+  label { display: block; font-weight: 600; margin: 16px 0 4px; }
+  label small { font-weight: 400; color: var(--muted); }
+  input, textarea { width: 100%; padding: 9px 10px; border: 1px solid #ccc; border-radius: 6px; font: inherit; }
+  textarea { min-height: 72px; font: 13px ui-monospace, Menlo, monospace; }
+  .row { display: flex; gap: 8px; margin: 18px 0; flex-wrap: wrap; align-items: center; }
+  button { font: inherit; padding: 8px 14px; border-radius: 6px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { color: #555; }
+  #status.err { color: var(--err); white-space: pre-wrap; }
+  .wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: #fafafa; }
+  td.url { word-break: break-all; min-width: 260px; }
+  td.raw { font: 11px ui-monospace, monospace; color: #777; word-break: break-all; max-width: 280px; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; background: #eef6ff; color: #075ea8; font-size: 12px; }
+  .missing { color: var(--err); }
+  footer { margin: 40px 0 20px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>Figma Image Source Exporter</h1>
+<p class="lead">Bulk-copy the original links of images that stock-photo plugins (Unsplash, Pexels and others) placed in your Figma file, instead of clicking "View image on …" one layer at a time.</p>
+<details>
+  <summary>How it works and privacy</summary>
+  <p>Some stock-photo plugins save the photo's link on each layer they fill. You can tell because a button like "View image on Unsplash" appears under <b>Tools</b> in Figma's right sidebar. Figma's API lets anyone with access to the file read that saved data. This page asks Figma's API for it and lists every link it finds.</p>
+  <p>The page runs entirely in your browser. Your token is sent only to <code>api.figma.com</code>. It's never sent anywhere else, and it's kept only in this browser if you tick "Remember".</p>
+  <p>Images added by plugins that don't save their source (or pasted or dragged in by hand) have no link to recover.</p>
+</details>
+
+<label>Figma file link <small>(right-click a frame → Copy link to selection to scan just that frame; much faster on big files)</small></label>
+<input id="fileUrl" placeholder="https://www.figma.com/design/AbC123xyz/My-file?node-id=12-34">
+
+<label>Figma personal access token <small>(Figma → Settings → Security → Personal access tokens, with "File content: read")</small></label>
+<input id="token" type="password" placeholder="figd_…" autocomplete="off">
+<label style="font-weight:400;margin-top:6px"><input type="checkbox" id="remember" style="width:auto"> Remember token in this browser</label>
+
+<label>Plugins to read <small>(one per line: the plugin's Community page link or its numeric ID, optionally followed by a name)</small></label>
+<textarea id="plugins" spellcheck="false">738454987945972471 Unsplash</textarea>
+
+<div class="row">
+  <button class="primary" id="go">Get links</button>
+  <button id="copy" disabled>Copy all links</button>
+  <button id="csv" disabled>Download CSV</button>
+  <span id="status"></span>
+</div>
+
+<div class="wrap">
+<table id="tbl" hidden>
+  <thead><tr><th>#</th><th>Layer</th><th>Plugin</th><th>Source link</th><th>Saved data</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+</div>
+
+<footer>Not affiliated with Figma, Unsplash or any plugin author.</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  del(k) { try { localStorage.removeItem(k); } catch (e) {} }
+};
+let results = [];
+
+// Restore saved settings
+if (store.get("fise_token")) { $("token").value = store.get("fise_token"); $("remember").checked = true; }
+if (store.get("fise_plugins")) $("plugins").value = store.get("fise_plugins");
+
+function parseFigmaUrl(u) {
+  const m = u.match(/figma\.com\/(?:file|design|proto|board)\/([A-Za-z0-9]+)/);
+  if (!m) return null;
+  let nodeId = null;
+  try { nodeId = new URL(u).searchParams.get("node-id"); } catch (e) {}
+  return { key: m[1], nodeId: nodeId ? nodeId.replace(/-/g, ":") : null };
+}
+
+// Each line: "<community link or id> [name]"
+function parsePlugins(text) {
+  const list = [];
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    const id = (t.match(/plugin\/(\d{6,})/) || t.match(/^(\d{6,})/) || [])[1];
+    if (!id) continue;
+    let name = t.replace(/^\S+\s*/, "").trim();
+    if (!name) { const slug = t.match(/plugin\/\d+\/([^/?#\s]+)/); name = slug ? decodeURIComponent(slug[1]).replace(/-/g, " ") : id; }
+    if (!list.some(p => p.id === id)) list.push({ id, name });
+  }
+  return list;
+}
+
+const URL_RE = /https?:\/\/[^\s"'<>\\)\]]+/gi;
+const IMG_EXT = /\.(jpe?g|png|webp|gif|avif)(\?|$)/i;
+const CDN_HOST = /^(images|cdn|img|static|media)\d*\./i;
+
+// Prefer a photo page link over a raw CDN image link
+function pickUrl(values) {
+  const urls = [...new Set(values.join(" \n ").match(URL_RE) || [])].map(u => u.replace(/[.,;]+$/, ""));
+  if (!urls.length) return "";
+  const score = u => {
+    let h = ""; try { h = new URL(u).hostname; } catch (e) { return -9; }
+    let s = 0;
+    if (/\/photos?\//i.test(u)) s += 3;
+    if (CDN_HOST.test(h)) s -= 2;
+    if (IMG_EXT.test(u)) s -= 1;
+    if (/api\./i.test(h)) s -= 3;
+    if (/\/(users?|@)[^/]+\/?$/i.test(u)) s -= 2;   // photographer profile links
+    return s;
+  };
+  return urls.sort((a, b) => score(b) - score(a))[0];
+}
+
+// Unsplash sometimes stores only a photo ID; turn it into a page link
+function unsplashFromId(values) {
+  for (const v of values) {
+    let found = null;
+    try {
+      const stack = [JSON.parse(v)];
+      while (stack.length && !found) {
+        const o = stack.pop();
+        if (o && typeof o === "object") {
+          for (const k of ["id", "photoId", "photo_id", "imageId"]) if (typeof o[k] === "string" && /^[A-Za-z0-9_-]{11}$/.test(o[k])) found = o[k];
+          stack.push(...Object.values(o));
+        }
+      }
+    } catch (e) { if (/^[A-Za-z0-9_-]{11}$/.test(v.trim())) found = v.trim(); }
+    if (found) return "https://unsplash.com/photos/" + found;
+  }
+  return "";
+}
+
+function walk(node, plugins, out) {
+  const hits = [];
+  for (const p of plugins) {
+    const pd = node.pluginData && node.pluginData[p.id];
+    if (pd && Object.keys(pd).length) hits.push({ plugin: p.name, values: Object.values(pd).map(String) });
+  }
+  if (node.sharedPluginData) {
+    for (const [ns, obj] of Object.entries(node.sharedPluginData)) {
+      const values = Object.values(obj).map(String);
+      if (values.some(v => URL_RE.test(v))) hits.push({ plugin: ns + " (shared)", values });
+      URL_RE.lastIndex = 0;
+    }
+  }
+  for (const h of hits) {
+    let url = pickUrl(h.values);
+    if (!url && /unsplash/i.test(h.plugin)) url = unsplashFromId(h.values);
+    out.push({ id: node.id, name: node.name, plugin: h.plugin, url, raw: h.values.join(" | ").slice(0, 400) });
+  }
+  for (const c of node.children || []) walk(c, plugins, out);
+}
+
+$("go").onclick = async () => {
+  const status = $("status");
+  const fail = msg => { status.className = "err"; status.textContent = msg; };
+  status.className = "";
+  const parsed = parseFigmaUrl($("fileUrl").value.trim());
+  const token = $("token").value.trim();
+  const plugins = parsePlugins($("plugins").value);
+  if (!parsed) return fail("That doesn't look like a Figma file link.");
+  if (!token) return fail("Add your Figma personal access token.");
+  if (!plugins.length) return fail("Add at least one plugin (Community link or numeric ID).");
+
+  if ($("remember").checked) store.set("fise_token", token); else store.del("fise_token");
+  store.set("fise_plugins", $("plugins").value);
+
+  const pd = encodeURIComponent([...plugins.map(p => p.id), "shared"].join(","));
+  const api = parsed.nodeId
+    ? `https://api.figma.com/v1/files/${parsed.key}/nodes?ids=${encodeURIComponent(parsed.nodeId)}&plugin_data=${pd}`
+    : `https://api.figma.com/v1/files/${parsed.key}?plugin_data=${pd}`;
+
+  $("go").disabled = true;
+  status.textContent = parsed.nodeId ? "Fetching selected frame…" : "Fetching whole file (can take a while for big files)…";
+  try {
+    const res = await fetch(api, { headers: { "X-Figma-Token": token } });
+    if (res.status === 403) throw new Error("Figma refused the request (403). Check the token is valid and has access to this file.");
+    if (res.status === 404) throw new Error("File or frame not found (404). Check the link.");
+    if (res.status === 429) throw new Error("Figma rate limit hit (429). Wait a minute and try again.");
+    if (!res.ok) throw new Error(`Figma API returned ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const data = await res.json();
+    results = [];
+    if (data.nodes) Object.values(data.nodes).forEach(n => n && n.document && walk(n.document, plugins, results));
+    else walk(data.document, plugins, results);
+    render();
+    const found = results.filter(r => r.url).length;
+    status.textContent = results.length
+      ? `${results.length} layers with plugin data · ${found} with a link`
+      : "No layers with saved data from these plugins. Check the plugin IDs, or the plugin may not save its source.";
+  } catch (e) {
+    fail(String(e.message || e) + (String(e).includes("Failed to fetch") ? "\n(Network error: check your connection and try again.)" : ""));
+  } finally {
+    $("go").disabled = false;
+  }
+};
+
+function render() {
+  $("tbl").hidden = !results.length;
+  $("copy").disabled = $("csv").disabled = !results.some(r => r.url);
+  $("rows").innerHTML = results.map((r, i) => `
+    <tr><td>${i + 1}</td><td>${esc(r.name)}</td><td><span class="tag">${esc(r.plugin)}</span></td>
+    <td class="url">${r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer">${esc(r.url)}</a>` : '<span class="missing">No link recognised</span>'}</td>
+    <td class="raw">${esc(r.raw)}</td></tr>`).join("");
+}
+
+$("copy").onclick = async () => {
+  const text = results.filter(r => r.url).map(r => r.url).join("\n");
+  try { await navigator.clipboard.writeText(text); }
+  catch (e) { const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); }
+  $("status").className = ""; $("status").textContent = `Copied ${text.split("\n").length} links`;
+};
+
+$("csv").onclick = () => {
+  const q = s => `"${String(s).replace(/"/g, '""')}"`;
+  const csv = "Layer,Node ID,Plugin,Link\n" + results.map(r => [r.name, r.id, r.plugin, r.url].map(q).join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  a.download = "figma-image-sources.csv"; a.click();
+};
+</script>
+</body>
+</html>
